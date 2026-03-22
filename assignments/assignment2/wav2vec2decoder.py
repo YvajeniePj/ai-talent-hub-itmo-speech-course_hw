@@ -83,8 +83,16 @@ class Wav2Vec2Decoder:
         Returns:
             str: Decoded transcript.
         """
-        # <YOUR CODE GOES HERE>
-        raise NotImplementedError
+        log_probs = torch.log_softmax(logits, dim=-1)
+        pred_ids = torch.argmax(log_probs, dim=-1).tolist()
+        filtered_ids = []
+        prev_id = -1
+        for token_id in pred_ids:
+            if token_id != prev_id:
+                if token_id != self.blank_token_id:
+                    filtered_ids.append(token_id)
+            prev_id = token_id
+        return self._ids_to_text(filtered_ids)
 
     def beam_search_decode(self, logits: torch.Tensor, return_beams: bool = False):
         """
@@ -103,10 +111,7 @@ class Wav2Vec2Decoder:
                 List[Tuple[List[int], float]] - list of (token_ids, log_prob)
                     tuples sorted best-first (if return_beams=True).
         """
-        # <YOUR CODE GOES HERE>
-        if return_beams:
-            raise NotImplementedError
-        raise NotImplementedError
+        return self._ctc_beam_search(logits, use_lm=False, return_beams=return_beams)
 
     def beam_search_with_lm(self, logits: torch.Tensor) -> str:
         """
@@ -122,8 +127,7 @@ class Wav2Vec2Decoder:
         """
         if not self.lm_model:
             raise ValueError("KenLM model required for LM shallow fusion")
-        # <YOUR CODE GOES HERE>
-        raise NotImplementedError
+        return self._ctc_beam_search(logits, use_lm=True, return_beams=False)
 
     def lm_rescore(self, beams: List[Tuple[List[int], float]]) -> str:
         """
@@ -138,8 +142,80 @@ class Wav2Vec2Decoder:
         """
         if not self.lm_model:
             raise ValueError("KenLM model required for LM rescoring")
-        # <YOUR CODE GOES HERE>
-        raise NotImplementedError
+        best_score = float('-inf')
+        best_text = ""
+        for token_ids, acoustic_score in beams:
+            text = self._ids_to_text(token_ids)
+            lm_score = self.lm_model.score(text, bos=True, eos=False) if text else 0.0
+            num_words = len(text.split())
+            score = acoustic_score + self.alpha * lm_score + self.beta * num_words
+            if score > best_score:
+                best_score = score
+                best_text = text
+        return best_text
+
+    def _ctc_beam_search(self, logits: torch.Tensor, use_lm: bool = False, return_beams: bool = False):
+        from collections import defaultdict
+        import heapq
+        
+        log_probs = torch.log_softmax(logits, dim=-1).tolist()
+        T_len = len(log_probs)
+        beam = {(): (0.0, float('-inf'))} # prefix -> (pb, pnb)
+        
+        cache = {}
+        def get_lm_score(prefix):
+            if prefix in cache:
+                return cache[prefix]
+            text = self._ids_to_text(prefix)
+            if not text:
+                cache[prefix] = (0.0, 0)
+                return 0.0, 0
+            lm_score = self.lm_model.score(text, bos=True, eos=False)
+            num_words = len(text.split())
+            cache[prefix] = (lm_score, num_words)
+            return lm_score, num_words
+
+        def score_fn(item):
+            prefix, (pb, pnb) = item
+            acoustic_score = _log_add(pb, pnb)
+            if not use_lm:
+                return acoustic_score
+            lm_score, num_words = get_lm_score(prefix)
+            return acoustic_score + self.alpha * lm_score + self.beta * num_words
+
+        for t in range(T_len):
+            trans_probs = log_probs[t]
+            next_beam = defaultdict(lambda: (float('-inf'), float('-inf')))
+            
+            # Prune to top 15 tokens
+            sorted_probs = sorted([(p, i) for i, p in enumerate(trans_probs)], reverse=True)
+            active_tokens = [idx for p, idx in sorted_probs[:15]]
+            if self.blank_token_id not in active_tokens:
+                active_tokens.append(self.blank_token_id)
+            
+            for prefix, (pb, pnb) in beam.items():
+                p_total = _log_add(pb, pnb)
+                for c in active_tokens:
+                    p_c = trans_probs[c]
+                    if c == self.blank_token_id:
+                        n_pb, n_pnb = next_beam[prefix]
+                        next_beam[prefix] = (_log_add(n_pb, p_total + p_c), n_pnb)
+                    else:
+                        c_pb, c_pnb = next_beam.get(prefix + (c,), (float('-inf'), float('-inf')))
+                        if len(prefix) > 0 and c == prefix[-1]:
+                            n_pb_curr, n_pnb_curr = next_beam[prefix]
+                            next_beam[prefix] = (n_pb_curr, _log_add(n_pnb_curr, pnb + p_c))
+                            next_beam[prefix + (c,)] = (c_pb, _log_add(c_pnb, pb + p_c))
+                        else:
+                            next_beam[prefix + (c,)] = (c_pb, _log_add(c_pnb, p_total + p_c))
+            
+            beam = dict(heapq.nlargest(self.beam_width, next_beam.items(), key=score_fn))
+            
+        res = [(list(prefix), _log_add(pb, pnb)) for prefix, (pb, pnb) in beam.items()]
+        res.sort(key=lambda x: x[1], reverse=True)
+        if return_beams:
+            return res
+        return self._ids_to_text(res[0][0])
 
     # -----------------------------------------------------------------------
     # Provided — do NOT modify
